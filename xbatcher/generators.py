@@ -571,11 +571,11 @@ class GCBatchGenerator:
         cache_preprocess: Optional[Callable] = None,
     ):
         
-        samples = BatchGenerator(ds,input_dims = {'time' : 3, 
+        samples = BatchGenerator(ds,input_dims = {'time' : input_dims['time'], 
                                                   'level' : ds.level.size,
                                                     'latitude' : ds.latitude.size,
                                                       'longitude' : ds.longitude.size},
-                                                        input_overlap = {'time' : 2},
+                                                        input_overlap = input_overlap,
                                                        preload_batch = False)
         
         
