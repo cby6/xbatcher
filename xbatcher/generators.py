@@ -563,8 +563,8 @@ class GCBatchGenerator(BatchGenerator):
         batch_dims = {'batch' : batch_size}
         input_dims = {'time' : 3+autoregressive_steps, 
                                                   'level' : ds.level.size,
-                                                    'lat' : ds.lat.size,
-                                                      'lon' : ds.lon.size}
+                                                    'lat' : ds.latitude.size,
+                                                      'lon' : ds.longitude.size}
         input_overlap = {'time' : 2+autoregressive_steps}
         self.task_config = task_config
         self.static_path = static_path
