@@ -14,13 +14,14 @@ from typing import (
     Sequence,
     Union,
 )
-
+import os
 import numpy as np
 import xarray as xr
 
 PatchGenerator = Iterator[Dict[Hashable, slice]]
 BatchSelector = List[Dict[Hashable, slice]]
 BatchSelectorSet = Dict[int, BatchSelector]
+
 
 
 class BatchSchema:
@@ -403,187 +404,6 @@ class BatchGenerator:
         self.cache_preprocess = cache_preprocess
 
         self._batch_selectors: BatchSchema = BatchSchema(
-            ds,
-            input_dims=input_dims,
-            input_overlap=input_overlap,
-            batch_dims=batch_dims,
-            concat_input_bins=concat_input_dims,
-            preload_batch=preload_batch,
-        )
-
-    @property
-    def input_dims(self):
-        return self._batch_selectors.input_dims
-
-    @property
-    def input_overlap(self):
-        return self._batch_selectors.input_overlap
-
-    @property
-    def batch_dims(self):
-        return self._batch_selectors.batch_dims
-
-    @property
-    def concat_input_dims(self):
-        return self._batch_selectors.concat_input_dims
-
-    @property
-    def preload_batch(self):
-        return self._batch_selectors.preload_batch
-
-    def __iter__(self) -> Iterator[Union[xr.DataArray, xr.Dataset]]:
-        for idx in self._batch_selectors.selectors:
-            yield self[idx]
-
-    def __len__(self) -> int:
-        return len(self._batch_selectors.selectors)
-
-    def __getitem__(self, idx: int) -> Union[xr.Dataset, xr.DataArray]:
-        if not isinstance(idx, int):
-            raise NotImplementedError(
-                f"{type(self).__name__}.__getitem__ currently requires a single integer key"
-            )
-
-        if idx < 0:
-            idx = list(self._batch_selectors.selectors)[idx]
-
-        if self.cache and self._batch_in_cache(idx):
-            return self._get_cached_batch(idx)
-
-        if idx in self._batch_selectors.selectors:
-            if self.concat_input_dims:
-                new_dim_suffix = "_input"
-                all_dsets: List = []
-                batch_selector = {}
-                for dim in self._batch_selectors.batch_dims.keys():
-                    starts = [
-                        x[dim].start for x in self._batch_selectors.selectors[idx]
-                    ]
-                    stops = [x[dim].stop for x in self._batch_selectors.selectors[idx]]
-                    batch_selector[dim] = slice(min(starts), max(stops))
-                batch_ds = self.ds.isel(batch_selector)
-                if self.preload_batch:
-                    batch_ds.load()
-                for selector in self._batch_selectors.selectors[idx]:
-                    patch_ds = self.ds.isel(selector)
-                    all_dsets.append(
-                        _drop_input_dims(
-                            patch_ds,
-                            self.input_dims,
-                            suffix=new_dim_suffix,
-                        )
-                    )
-                dsc = xr.concat(all_dsets, dim="input_batch")
-                new_input_dims = [str(dim) + new_dim_suffix for dim in self.input_dims]
-                batch = _maybe_stack_batch_dims(dsc, new_input_dims)
-            else:
-                batch_ds = self.ds.isel(self._batch_selectors.selectors[idx][0])
-                if self.preload_batch:
-                    batch_ds.load()
-                batch = _maybe_stack_batch_dims(
-                    batch_ds,
-                    list(self.input_dims),
-                )
-        else:
-            raise IndexError("list index out of range")
-
-        if self.cache is not None and self.cache_preprocess is not None:
-            batch = self.cache_preprocess(batch)
-        if self.cache is not None:
-            self._cache_batch(idx, batch)
-
-        return batch
-
-    def _batch_in_cache(self, idx: int) -> bool:
-        return self.cache is not None and f"{idx}/.zgroup" in self.cache
-
-    def _cache_batch(self, idx: int, batch: Union[xr.Dataset, xr.DataArray]) -> None:
-        batch.to_zarr(self.cache, group=str(idx), mode="a")
-
-    def _get_cached_batch(self, idx: int) -> xr.Dataset:
-        ds = xr.open_zarr(self.cache, group=str(idx))
-        if self.preload_batch:
-            ds = ds.load()
-        return ds
-
-
-def process_sample(sample):
-
-    sample = sample.expand_dims('batch',0)
-    sample = sample.rename({'latitude' : 'lat', 'longitude' : 'lon'})
-    sample = sample.assign_coords(datetime = (('batch','time'),[sample.time.data]))
-    time = sample.time.isel(time=1).data
-    sample = sample.assign_coords(time = sample.time - time)
-    return sample
-
-    
-class GCBatchGenerator:
-    """Create generator for iterating through Xarray DataArrays / Datasets in
-    batches.
-
-    Parameters
-    ----------
-    ds : ``xarray.Dataset`` or ``xarray.DataArray``
-        The data to iterate over
-    input_dims : dict
-        A dictionary specifying the size of the inputs in each dimension,
-        e.g. ``{'lat': 30, 'lon': 30}``
-        These are the dimensions the ML library will see. All other dimensions
-        will be stacked into one dimension called ``sample``.
-    input_overlap : dict, optional
-        A dictionary specifying the overlap along each dimension
-        e.g. ``{'lat': 3, 'lon': 3}``
-    batch_dims : dict, optional
-        A dictionary specifying the size of the batch along each dimension
-        e.g. ``{'time': 10}``. These will always be iterated over.
-    concat_input_dims : bool, optional
-        If ``True``, the dimension chunks specified in ``input_dims`` will be
-        concatenated and stacked into the ``sample`` dimension. The batch index
-        will be included as a new level ``input_batch`` in the ``sample``
-        coordinate.
-        If ``False``, the dimension chunks specified in ``input_dims`` will be
-        iterated over.
-    preload_batch : bool, optional
-        If ``True``, each batch will be loaded into memory before reshaping /
-        processing, triggering any dask arrays to be computed.
-    cache : dict, optional
-        Dict-like object to cache batches in (e.g., Zarr DirectoryStore). Note:
-        The caching API is experimental and subject to change.
-    cache_preprocess: callable, optional
-        A function to apply to batches prior to caching.
-        Note: The caching API is experimental and subject to change.
-
-    Yields
-    ------
-    ds_slice : ``xarray.Dataset`` or ``xarray.DataArray``
-        Slices of the array matching the given batch size specification.
-    """
-
-    def __init__(
-        self,
-        ds: Union[xr.Dataset, xr.DataArray],
-        input_dims: Dict[Hashable, int],
-        input_overlap: Dict[Hashable, int] = {},
-        batch_dims: Dict[Hashable, int] = {},
-        concat_input_dims: bool = False,
-        preload_batch: bool = True,
-        cache: Optional[Dict[str, Any]] = None,
-        cache_preprocess: Optional[Callable] = None,
-    ):
-        
-        samples = BatchGenerator(ds,input_dims = {'time' : input_dims['time'], 
-                                                  'level' : ds.level.size,
-                                                    'latitude' : ds.latitude.size,
-                                                      'longitude' : ds.longitude.size},
-                                                        input_overlap = input_overlap,
-                                                       preload_batch = False)
-        
-        
-        self.ds = xr.concat([process_sample(sample) for sample in samples],'batch')
-        # self.ds = ds
-        self.cache = cache
-        self.cache_preprocess = cache_preprocess
-        self._batch_selectors: BatchSchema = BatchSchema(
             self.ds,
             input_dims=input_dims,
             input_overlap=input_overlap,
@@ -686,3 +506,98 @@ class GCBatchGenerator:
         if self.preload_batch:
             ds = ds.load()
         return ds
+
+class GCBatchGenerator(BatchGenerator):
+    """Create generator for iterating through Xarray DataArrays / Datasets in
+    batches.
+
+    Parameters
+    ----------
+    ds : ``xarray.Dataset`` or ``xarray.DataArray``
+        The data to iterate over
+    concat_input_dims : bool, optional
+        If ``True``, the dimension chunks specified in ``input_dims`` will be
+        concatenated and stacked into the ``sample`` dimension. The batch index
+        will be included as a new level ``input_batch`` in the ``sample``
+        coordinate.
+        If ``False``, the dimension chunks specified in ``input_dims`` will be
+        iterated over.
+    preload_batch : bool, optional
+        If ``True``, each batch will be loaded into memory before reshaping /
+        processing, triggering any dask arrays to be computed.
+    cache : dict, optional
+        Dict-like object to cache batches in (e.g., Zarr DirectoryStore). Note:
+        The caching API is experimental and subject to change.
+    cache_preprocess: callable, optional
+        A function to apply to batches prior to caching.
+        Note: The caching API is experimental and subject to change.
+
+    Yields
+    ------
+    ds_slice : ``xarray.Dataset`` or ``xarray.DataArray``
+        Slices of the array matching the given batch size specification.
+    """
+
+    def __init__(
+        self,
+        ds: Union[xr.Dataset, xr.DataArray],
+        task_config,
+        concat_input_dims: bool = False,
+        preload_batch: bool = True,
+        cache: Optional[Dict[str, Any]] = None,
+        cache_preprocess: Optional[Callable] = None,
+        autoregressive_steps: Union[float,int] = 0,
+        batch_size: Union[float,int] = 1,
+        static_path: Optional[Union[str,os.PathLike]] = None
+    ):
+        if isinstance(cache,os.PathLike):
+            cache = os.fspath(cache)
+        if cache is not None:
+            if os.path.exists(cache):
+                os.system(f'rm -r {cache}')
+                
+        ds = ds[[v for v in ds.data_vars if v in \
+                 list(task_config.input_variables)+list(task_config.target_variables) and \
+                 v not in task_config.forcing_variables]]
+
+        batch_dims = {'batch' : batch_size}
+        input_dims = {'time' : 3+autoregressive_steps, 
+                                                  'level' : ds.level.size,
+                                                    'lat' : ds.lat.size,
+                                                      'lon' : ds.lon.size}
+        input_overlap = {'time' : 2+autoregressive_steps}
+        self.task_config = task_config
+        self.static_path = static_path
+        self.samples = [self.process_sample(sample) for sample in BatchGenerator(ds,
+                                                                    input_dims = input_dims,
+                                                                    input_overlap = input_overlap,
+                                                                    preload_batch = False)]
+        
+        self.ds = xr.concat(self.samples,'batch')
+        # self.ds = self.ds.chunk({'batch' : batch_size, 'time' : -1, 'lat' : -1, 'lon' : -1})
+        self.cache = cache
+        self.cache_preprocess = cache_preprocess
+        self._batch_selectors: BatchSchema = BatchSchema(
+            self.ds,
+            input_dims=input_dims,
+            # input_overlap=input_overlap,
+            batch_dims=batch_dims,
+            concat_input_bins=concat_input_dims,
+            preload_batch=preload_batch,
+        )
+            
+    def process_sample(self,sample):
+
+        sample = sample.expand_dims('batch',0)
+        if 'latitude' in sample.dims:
+            sample = sample.rename({'latitude' : 'lat'})
+        if 'longitude' in sample.dims:
+            sample = sample.rename({'longitude' : 'lon'})
+            
+        sample = sample.assign_coords(datetime = (('batch','time'),[sample.time.data]))
+        time = sample.time.isel(time=1).data
+        sample = sample.assign_coords(time = sample.time - time)
+        # sample = sample.chunk({'batch' : 1, 'time' : -1, 'lat' : -1, 'lon' : -1})
+        sample = sample.load()
+        sample = sample.chunk({'batch' : 1, 'time' : -1, 'lat' : -1, 'lon' : -1})
+        return sample
